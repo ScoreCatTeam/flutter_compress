@@ -13,6 +13,7 @@ import androidx.media3.transformer.Composition
 import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.DefaultMuxer
 import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.EditedMediaItemSequence
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.EncoderUtil
 import androidx.media3.transformer.ExportException
@@ -74,7 +75,12 @@ class CompressionEngine(
     fun estimate(path: String, config: CompressionConfig): Map<String, Any?> {
         val info = MediaProbe.videoInfo(path)
         val durationMs = clampDuration(info["durationMs"] as Long, config)
-        val (tw, th) = SizeMath.targetDimensions(info["width"] as Int, info["height"] as Int, config)
+        val (tw, th) = SizeMath.targetDimensions(
+            info["width"] as Int,
+            info["height"] as Int,
+            config,
+            info["rotation"] as Int,
+        )
         val videoBps = SizeMath.videoBitrateBps(config, durationMs, info["bitrateKbps"] as Int, th)
         val audioBps = if (config.removeAudio) 0 else (config.audioBitrateKbps ?: 128) * 1000
         val totalBits = (videoBps + audioBps).toLong() * durationMs / 1000
@@ -103,9 +109,11 @@ class CompressionEngine(
         val info = MediaProbe.videoInfo(path)
         val srcW = info["width"] as Int
         val srcH = info["height"] as Int
+        val rotation = info["rotation"] as Int
+        val (dispW, dispH) = if (rotation % 180 != 0) srcH to srcW else srcW to srcH
         val originalSize = File(path).length()
         val durationMs = clampDuration(info["durationMs"] as Long, config)
-        val (tw, th) = SizeMath.targetDimensions(srcW, srcH, config)
+        val (tw, th) = SizeMath.targetDimensions(srcW, srcH, config, rotation)
         val videoMime = resolveVideoMime(config.codec)
         val usedCodec = if (videoMime == MimeTypes.VIDEO_H265) "h265" else "h264"
         val videoBps = SizeMath.videoBitrateBps(config, durationMs, info["bitrateKbps"] as Int, th)
@@ -120,7 +128,7 @@ class CompressionEngine(
         var outDurationMs = durationMs
         try {
             val export = runTransformer(
-                id, buildEditedItem(path, config, srcW, srcH, tw, th), outFile, videoMime,
+                id, buildEditedItem(path, config, dispW, dispH, tw, th), outFile, videoMime,
                 encoderSettings(config, videoMime, videoBps), config.notification,
             )
             if (export.durationMs > 0) outDurationMs = export.durationMs
@@ -169,7 +177,7 @@ class CompressionEngine(
     }
 
     private fun buildEditedItem(
-        path: String, config: CompressionConfig, srcW: Int, srcH: Int, tw: Int, th: Int,
+        path: String, config: CompressionConfig, dispW: Int, dispH: Int, tw: Int, th: Int,
     ): EditedMediaItem {
         val item = MediaItem.Builder().setUri(Uri.fromFile(File(path)))
         if (config.trimStartMs != null && config.trimEndMs != null) {
@@ -180,11 +188,12 @@ class CompressionEngine(
                     .build(),
             )
         }
-        // Only attach a scaling effect when the size actually changes. Attaching
-        // it unconditionally runs every frame through the GL pipeline, which on
-        // slower devices produces frames faster than the encoder drains them —
-        // the surface runs out of buffers and frames are silently dropped.
-        val effects = if (tw == srcW && th == srcH) {
+        // Only attach a scaling effect when the display size actually changes.
+        // Attaching it unconditionally runs every frame through the GL pipeline,
+        // which on slower devices produces frames faster than the encoder drains
+        // them — the surface runs out of buffers and frames are silently dropped.
+        // [dispW]/[dispH] are upright pixels (rotation already swapped).
+        val effects = if (tw == dispW && th == dispH) {
             Effects(emptyList(), emptyList())
         } else {
             Effects(
@@ -251,7 +260,7 @@ class CompressionEngine(
             .build()
 
         val transformer = Transformer.Builder(context)
-            .setVideoMimeType(videoMime)
+            .setVideoMimeType(MimeTypes.VIDEO_H264)
             .setAudioMimeType(MimeTypes.AUDIO_AAC)
             .setEncoderFactory(encoderFactory)
             // Use the default muxer factory. Its `long` overload is NOT a timeout:
@@ -286,13 +295,32 @@ class CompressionEngine(
             })
             .build()
 
-        activeTransformer = transformer
-        activeId = id
-        activeCont = cont
-        serviceStarted = CompressionService.start(context, notification)
-        transformer.start(editedItem, outFile.absolutePath)
-        startProgressPolling(id, outFile)
         cont.invokeOnCancellation { mainHandler.post { runCatching { transformer.cancel() } } }
+        // Register, re-check, and start on the main looper, the same queue abort()
+        // uses. A cancel posted while the file was probed sets preCancelledId
+        // before this runnable, so the job must not reach transformer.start.
+        mainHandler.post {
+            if (!cont.isActive) return@post
+            activeTransformer = transformer
+            activeId = id
+            activeCont = cont
+            serviceStarted = CompressionService.start(context, notification)
+            if (preCancelledId == id) {
+                preCancelledId = null
+                runCatching { transformer.cancel() }
+                val waiting = activeCont
+                finishJob()
+                if (waiting != null && waiting.isActive) {
+                    waiting.resumeWithException(CompressionCancelledException())
+                }
+                return@post
+            }
+            val composition = Composition.Builder(EditedMediaItemSequence(editedItem))
+                .setHdrMode(Composition.HDR_MODE_TONE_MAP_HDR_TO_SDR_USING_OPEN_GL)
+                .build()
+            transformer.start(composition, outFile.absolutePath)
+            startProgressPolling(id, outFile)
+        }
     }
 
     /** Tear down the active job's bookkeeping. Must run on the main looper. */

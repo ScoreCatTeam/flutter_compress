@@ -57,21 +57,34 @@ object SizeMath {
     }
 
     /**
-     * Compute output width/height: preserve aspect, only ever scale down to the
-     * requested caps, then align per [CompressionConfig.alignment].
+     * Compute output width/height on display axes: swap when [rotationDegrees]
+     * is 90 or 270, preserve aspect, only ever scale down to the requested caps,
+     * then align per [CompressionConfig.alignment].
+     *
+     * Media3 1.4.1 has no `Presentation.createForShortSide`. The decoder rotates
+     * frames upright before Presentation, so the caps are applied to that
+     * display size. Alignment is unchanged (caller-controlled).
      */
-    fun targetDimensions(srcW: Int, srcH: Int, config: CompressionConfig): Pair<Int, Int> {
+    fun targetDimensions(
+        srcW: Int,
+        srcH: Int,
+        config: CompressionConfig,
+        rotationDegrees: Int = 0,
+    ): Pair<Int, Int> {
         if (srcW <= 0 || srcH <= 0) return srcW to srcH
+        val dw = if (rotationDegrees % 180 != 0) srcH else srcW
+        val dh = if (rotationDegrees % 180 != 0) srcW else srcH
         val maxW = config.maxWidth
         val maxH = config.maxHeight
-        // No cap requested → keep the source exactly. Aligning here would round
-        // 1080 *up* to 1088, which both breaks the "only ever scale down" promise
-        // and forces a full-frame GL rescale that starves the encoder on slower
-        // devices (frames get dropped, so the output is short, not just smaller).
-        if (maxW == null && maxH == null) return srcW to srcH
+        // No cap requested → keep the display size exactly. Aligning here would
+        // round 1080 *up* to 1088, which both breaks the "only ever scale down"
+        // promise and forces a full-frame GL rescale that starves the encoder on
+        // slower devices (frames get dropped, so the output is short, not just
+        // smaller).
+        if (maxW == null && maxH == null) return dw to dh
 
-        var w = srcW.toDouble()
-        var h = srcH.toDouble()
+        var w = dw.toDouble()
+        var h = dh.toDouble()
         if (maxW != null && w > maxW) {
             val s = maxW / w; w *= s; h *= s
         }
